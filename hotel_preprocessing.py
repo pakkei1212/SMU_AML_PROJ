@@ -1,131 +1,103 @@
-# hotel_preprocessing.py
-
 import pandas as pd
 import numpy as np
-from datetime import timedelta
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import MinMaxScaler
-
-def impute_median(series):
-    #print(series.median())
-    return series.fillna(series.median())
-
-def clean_data(df):
-    df = df.copy()
-    df['children'] = df['children'].transform(impute_median)  # Assumes you have this function defined
-    df['agent'] = df['agent'].astype('object').fillna('Not Specified')
-    df['country'] = df['country'].fillna(str(df['country'].mode()[0]))
-    df.drop_duplicates(inplace=True)
-    return df
-
-def extract_features(df):
-    df = df.copy()
-
-    df['arrival_date'] = pd.to_datetime(
-        df['arrival_date_year'].astype(str) + '-' +
-        df['arrival_date_month'] + '-' +
-        df['arrival_date_day_of_month'].astype(str)
-    )
-
-    latest_date = df['arrival_date'].max()
-    three_months_ago = latest_date - timedelta(days=90)
-    df['arrival_date_in_3_month'] = (df['arrival_date'] >= three_months_ago).astype(int)
-
-    #print(f"Percentage of data within the last 3 months: {(df['arrival_date_in_3_month'].mean() * 100):.2f}%")
-
-    #df['is_canceled'] = df['is_canceled'].astype(int)
-    df['lead_time_log'] = np.log1p(df['lead_time'])
-    df['booking_changes_log'] = np.log1p(df['booking_changes'])
-
-    season_map = {
-        'December': 'Winter', 'January': 'Winter', 'February': 'Winter',
-        'March': 'Spring', 'April': 'Spring', 'May': 'Spring',
-        'June': 'Summer', 'July': 'Summer', 'August': 'Summer',
-        'September': 'Fall', 'October': 'Fall', 'November': 'Fall'
-    }
-    df['arrival_date_season'] = df['arrival_date_month'].map(season_map)
-
-    meal = {'BB': 1, 'HB': 1, 'FB': 1, 'SC': 0, 'Undefined': 0}
-    df['meal_bin'] = df['meal'].apply(lambda x: meal.get(x, 0))
-
-    df['total_guests'] = df['adults'] + df['children'].astype(int) + df['babies']
-    df['room_type_match'] = (df['reserved_room_type'] == df['assigned_room_type']).astype(int)
-
-    # Top N binning (calculate based on current df, not external hotel_data)
-    top_N_countries = df['country'].value_counts().nlargest(10).index
-    df['country_binned'] = df['country'].apply(lambda x: x if x in top_N_countries else 'Other')
-    #print(f"Top 10 Frequent Countries: {list(top_N_countries)}")
-
-    top_N_agents = df['agent'].value_counts().nlargest(5).index
-    df['agent_binned'] = df['agent'].apply(lambda x: x if x in top_N_agents else 'Other')
-    #print(f"Top 5 Frequent Agents: {list(top_N_agents)}")
-
-    return df
-
-def drop_columns(df):
-    df = df.copy()
-    dropped_cols = [
-        'company', 'agent', 'arrival_date_week_number',
-        'reservation_status_date', 'reservation_status',
-        'arrival_date',
-        'meal', 'country'
-    ]
-    df.drop(dropped_cols, axis=1, inplace=True, errors='ignore')
-    return df
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 
 class XYPreprocessor:
-    def __init__(self, drop_first=False):
-        self.drop_first = drop_first
-        self.scaler = MinMaxScaler()
-        self.numeric_cols = []
-        self.cat_cols = []
-        self.fitted_columns = None  # store full column set after encoding
+    def __init__(self, top_n_categories=10, top_n_dict=None):
+        self.top_n_categories = top_n_categories
+        self.top_n_dict = top_n_dict or {}
+        self.top_categories_map = {}
+        self.numeric_features = None
+        self.categorical_features = None
+        self.column_transformer = None
+        self.feature_names_ = None
 
-    def fit(self, X, y):
-        X, y = self._apply_cleaning(X, y)
+    def clean_data(self, df):
+        df = df.copy()
+        df['children'] = df['children'].fillna(df['children'].median())
+        df['country'] = df['country'].fillna('Unknown')
+        df['agent'] = df['agent'].astype('object').fillna('Not Specified')
+        df['company'] = df['company'].fillna(0)
+        df = df.drop_duplicates()
+        df = df[~((df['adults'] == 0) & (df['children'] == 0) & (df['babies'] == 0))]
+        df = df[~((df['stays_in_weekend_nights'] == 0) & (df['stays_in_week_nights'] == 0))]
+        return df
 
-        self.numeric_cols = X.select_dtypes(include=['int', 'float']).columns.tolist()
-        self.cat_cols = X.select_dtypes(include=['object']).columns.tolist()
+    def extract_features(self, df):
+        df = df.copy()
+        df['arrival_date'] = pd.to_datetime(
+            df['arrival_date_year'].astype(str) + '-' +
+            df['arrival_date_month'].astype(str) + '-' +
+            df['arrival_date_day_of_month'].astype(str), errors='coerce')
+        df['total_guests'] = df['adults'] + df['children'] + df['babies']
+        df['total_nights'] = df['stays_in_weekend_nights'] + df['stays_in_week_nights']
+        df['arrival_date_month'] = pd.to_datetime(df['arrival_date_month'], format='%B').dt.month
+        df['lead_time_log'] = np.log1p(df['lead_time'].fillna(0))
+        df['booking_changes_log'] = np.log1p(df['booking_changes'].fillna(0))
+        season_map = {12: 'Winter', 1: 'Winter', 2: 'Winter',
+                      3: 'Spring', 4: 'Spring', 5: 'Spring',
+                      6: 'Summer', 7: 'Summer', 8: 'Summer',
+                      9: 'Fall', 10: 'Fall', 11: 'Fall'}
+        df['arrival_date_season'] = df['arrival_date_month'].map(season_map)
+        meal_map = {'BB': 1, 'HB': 1, 'FB': 1, 'SC': 0, 'Undefined': 0}
+        df['meal_bin'] = df['meal'].apply(lambda x: meal_map.get(x, 0))
+        df['room_type_match'] = (df['reserved_room_type'] == df['assigned_room_type']).astype(int)
+        df['booking_weekday'] = pd.to_datetime(df['reservation_status_date'], errors='coerce').dt.dayofweek.map({
+            0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday',
+            4: 'Friday', 5: 'Saturday', 6: 'Sunday'})
+        df['arrival_weekend'] = df['arrival_date_day_of_month'].isin([5,6,12,13,19,20,26,27]).astype(int)
+        # Fix mixed types for OneHotEncoder
+        categorical_cols = df.select_dtypes(include=['object']).columns
+        df[categorical_cols] = df[categorical_cols].astype(str)
+        return df
 
-        self.scaler.fit(X[self.numeric_cols])
+    def drop_columns(self, df):
+        cols_to_drop = [
+            'company', 'arrival_date_week_number',
+            'reservation_status_date', 'reservation_status',
+            'arrival_date', 'meal',
+            'assigned_room_type', 'reserved_room_type'
+        ]
+        return df.drop(columns=cols_to_drop)
 
-        # Apply get_dummies to capture all possible one-hot columns
-        X_scaled = X.copy()
-        X_scaled[self.numeric_cols] = self.scaler.transform(X[self.numeric_cols])
-        X_encoded = pd.get_dummies(X_scaled, columns=self.cat_cols, drop_first=self.drop_first, dtype='int')
+    def clean_and_feature_engineer(self, df):
+        df_clean = self.clean_data(df.copy())
+        df_feat = self.extract_features(df_clean)
+        return df_feat
 
-        self.fitted_columns = X_encoded.columns  # save full column set
-        return self
+    def fit(self, df, y):
+        df_feat = self.clean_and_feature_engineer(df.copy())
+        df_feat = df_feat.drop(columns=['is_canceled'], errors='ignore')
+        y_aligned = y.loc[df_feat.index]
+        df_features = self.drop_columns(df_feat)
+        self.numeric_features = df_features.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        self.categorical_features = df_features.select_dtypes(include=['object']).columns.tolist()
+        numeric_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ])
+        categorical_transformer = Pipeline(steps=[
+            ("onehot", OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
+        self.column_transformer = ColumnTransformer(transformers=[
+            ("num", numeric_transformer, self.numeric_features),
+            ("cat", categorical_transformer, self.categorical_features)
+        ])
+        self.column_transformer.fit(df_features, y_aligned)
+        self.feature_names_ = self.column_transformer.get_feature_names_out()
+        return self, df_features, y_aligned
 
-    def transform(self, X, y=None):
-        if y is not None:
-            X, y = self._apply_cleaning(X, y)
-            y = y.loc[X.index]
-        else:
-            X = self._apply_cleaning(X)
-
-        X[self.numeric_cols] = self.scaler.transform(X[self.numeric_cols])
-        X = pd.get_dummies(X, columns=self.cat_cols, drop_first=self.drop_first, dtype='int')
-
-        # Reindex to match training columns
-        X = X.reindex(columns=self.fitted_columns, fill_value=0)
-
-        if y is not None:
-            return X, y
-        else:
-            return X
-
-    def fit_transform(self, X, y):
-        return self.fit(X, y).transform(X, y)
-
-    def _apply_cleaning(self, X, y=None):
-        X = X.copy()
-        X = clean_data(X)
-        X = extract_features(X)
-        X = drop_columns(X)
-        if y is not None:
-            y = y.loc[X.index]
-            return X, y
-        return X
+    def transform(self, df):
+        df_feat = self.clean_and_feature_engineer(df.copy())
+        df_features = self.drop_columns(df_feat)
+        transformed_array = self.column_transformer.transform(df_features)
+        return pd.DataFrame(transformed_array, columns=self.feature_names_, index=df_features.index)
 
 
+    def fit_transform(self, df, y):
+        self, df_features, y_aligned = self.fit(df, y)
+        transformed_array = self.column_transformer.transform(df_features)
+        return pd.DataFrame(transformed_array, columns=self.feature_names_, index=df_features.index), y_aligned
